@@ -1,12 +1,6 @@
 #include "mmpool.h"
 #include <thread>
 
-#if defined(__GNUC__) || defined(__clang__)
-# define unlikely(x) __builtin_expect(!!(x), 0)
-#else
-# define unlikely(x) (x)
-#endif
-
 void MemoryPool::init_memory_pool() {
   memory_pool.reserve(NUM_BLOCKS);
   for (size_t i = 0; i < NUM_BLOCKS; ++i) {
@@ -66,61 +60,64 @@ void MemoryPool::set_free_chunk() {
 // Write a specified free block of a free window
 bool MemoryIdxPool::write_free_chunk(uint8_t idx, size_t mem_idx) {
   size_t page_w_idx;
-  {
-    std::lock_guard<SpinLock> lock(order_mutex);
 
-    page_w_idx = idx + group_w_offset.load(std::memory_order_relaxed);
-    // Processing of winding data at the boundary
-    if (unlikely(memory_order_ptr[page_w_idx].is_free.load(std::memory_order_relaxed) == false)) {
-      size_t this_group = group_w_idx.load(std::memory_order_relaxed);
-      size_t offset = ((this_group & REM_MAX_GROUPING_IDX) * MAX_IDX);
-      page_w_idx = idx + offset;
-      write_next_count.fetch_add(1, std::memory_order_relaxed);
-      // Lookup failed
-      if (memory_order_ptr[page_w_idx].is_free.load(std::memory_order_relaxed) == false) {
-        printf("This block has been written, and there is a duplicate packge idx %d\n", idx);
-        return false;
-      }
-    } else {
-      write_count.fetch_add(1, std::memory_order_relaxed);
-      // Proceed to the next group
-      if (unlikely(write_count.load(std::memory_order_relaxed) == MAX_IDX)) {
-        memory_order_ptr[page_w_idx].is_free.store(false);
-        memory_order_ptr[page_w_idx].memblock_idx.store(mem_idx);
-        size_t next_w_idx = wait_next_free_group();
-        group_w_offset.store((next_w_idx & REM_MAX_GROUPING_IDX) * MAX_IDX);
-        write_count.store(write_next_count);
-        write_next_count.store(0);
-        return true;
-      }
+  page_w_idx = idx + group_w_offset.load(std::memory_order_relaxed);
+#if (CONFIG_DMA_CHANNELS > 1)
+  // Processing of winding data at the boundary
+  if (memory_order_ptr[page_w_idx].is_free.load(std::memory_order_relaxed) == false) {
+    size_t this_group = group_w_idx.load(std::memory_order_relaxed);
+    size_t offset = ((this_group & REM_MAX_GROUPING_IDX) * MAX_IDX);
+    page_w_idx = idx + offset;
+    write_next_count.fetch_add(1, std::memory_order_relaxed);
+    // Lookup failed
+    if (memory_order_ptr[page_w_idx].is_free.load(std::memory_order_relaxed) == false) {
+      printf("This block has been written, and there is a duplicate packge idx %d\n", idx);
+      return false;
     }
-    memory_order_ptr[page_w_idx].is_free.store(false);
+  } else {
+#endif
+    write_count.fetch_add(1, std::memory_order_relaxed);
+    // Proceed to the next group
+    if (write_count.load(std::memory_order_relaxed) == MAX_IDX) {
+      memory_order_ptr[page_w_idx].is_free.store(false, std::memory_order_relaxed);
+      memory_order_ptr[page_w_idx].memblock_idx.store(mem_idx, std::memory_order_relaxed);
+      size_t next_w_idx = wait_next_free_group();
+      group_w_offset.store((next_w_idx & REM_MAX_GROUPING_IDX) * MAX_IDX);
+      write_count.store(write_next_count);
+      write_next_count.store(0);
+      chunk_semaphore.store(false, std::memory_order_release);
+      return true;
+    }
+#if (CONFIG_DMA_CHANNELS > 1)
   }
+#endif
+  memory_order_ptr[page_w_idx].is_free.store(false);
   memory_order_ptr[page_w_idx].memblock_idx.store(mem_idx);
+  chunk_semaphore.store(false, std::memory_order_release);
   return true;
 }
 
 char *MemoryIdxPool::get_free_chunk(size_t *mem_idx) {
-  {
-    std::lock_guard<SpinLock> lock(offset_mutexes);
-    size_t page_w_idx = mem_chunk_idx.load();
-    if (mem_chunk_idx == NUM_BLOCKS - 1)
-      mem_chunk_idx.store(0);
-    else
-      mem_chunk_idx.fetch_add(1, std::memory_order_relaxed);
-    if (memory_pool[page_w_idx].is_free.load(std::memory_order_relaxed) == true)
-    {
-      memory_pool[page_w_idx].is_free.store(false);
-      *mem_idx = page_w_idx;
-      return memory_pool[page_w_idx].data.get();
-    }
+  while (chunk_semaphore.exchange(true, std::memory_order_acquire)) {
+    std::this_thread::yield(); // sleep_for
   }
 
+  size_t page_w_idx = mem_chunk_idx.fetch_add(1, std::memory_order_relaxed);
+  if (page_w_idx == NUM_BLOCKS - 1)
+    mem_chunk_idx.store(0, std::memory_order_relaxed);
+
+  if (memory_pool_is_free[page_w_idx].load(std::memory_order_relaxed) == true) {
+    memory_pool_is_free[page_w_idx].store(false);
+    *mem_idx = page_w_idx;
+    return memory_pool[page_w_idx];
+  }
   return nullptr;
 }
 
 void MemoryIdxPool::wait_mempool_start() {
-  while(check_group() == false);
+  std::this_thread::sleep_for(std::chrono::nanoseconds(10));
+  while (check_group() == false)
+    std::this_thread::yield(); 
 }
 
 char *MemoryIdxPool::read_busy_chunk() {
@@ -130,7 +127,7 @@ char *MemoryIdxPool::read_busy_chunk() {
     return nullptr;
   }
   size_t memory_pool_idx = memory_order_ptr[page_r_idx].memblock_idx.load();
-  char *data = memory_pool[memory_pool_idx].data.get();
+  char *data = memory_pool[memory_pool_idx];
   wait_setfree_mem_idx.store(memory_pool_idx, std::memory_order_relaxed);
   wait_setfree_ptr_idx.store(page_r_idx, std::memory_order_relaxed);
 
@@ -139,7 +136,7 @@ char *MemoryIdxPool::read_busy_chunk() {
 
 void MemoryIdxPool::set_free_chunk() {
   memory_order_ptr[wait_setfree_ptr_idx].is_free.store(true, std::memory_order_relaxed);
-  memory_pool[wait_setfree_mem_idx].is_free.store(true, std::memory_order_relaxed);
+  memory_pool_is_free[wait_setfree_mem_idx].store(true, std::memory_order_relaxed);
   if (++read_count == MAX_IDX) {
     size_t next_r_idx = wait_next_full_group();
     group_r_offset = ((next_r_idx & REM_MAX_GROUPING_IDX) * MAX_IDX);
